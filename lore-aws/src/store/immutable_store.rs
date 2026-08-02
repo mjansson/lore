@@ -1793,6 +1793,312 @@ mod test {
             .await
     }
 
+    /// Reproductions of two data corruption cases in the AWS fragment write path.
+    ///
+    /// Both come from the same root cause: a put whose exact `(partition, context, hash)` row is
+    /// missing always uploads, even when the payload for that hash is already stored. Since the
+    /// S3 key is the bare content hash, that upload *replaces* content another partition is
+    /// using, and because the object and the metadata describing it are written as two separate,
+    /// unordered operations, the pair can be observed — or left — disagreeing.
+    ///
+    /// Every test here asserts the behaviour the store should have. They fail on this branch;
+    /// each failure message names the corruption it found.
+    mod corruption {
+        use std::collections::HashSet;
+        use std::sync::Mutex;
+
+        use super::*;
+
+        /// Number of writers racing for the same content.
+        const WRITERS: u8 = 6;
+        /// Base compressed length; each writer's representation is a different length.
+        const BASE_PAYLOAD_LEN: usize = 64;
+        /// Uncompressed size, shared by every representation because it is the same content.
+        const CONTENT_SIZE: u64 = 4096;
+
+        /// Stored state for a single hash, standing in for S3 and DynamoDB.
+        ///
+        /// One mutex, so each operation is atomic with respect to the others — which is what the
+        /// real services give per object and per item. The corruption reproduced here does not
+        /// need torn individual writes; it comes from two separately atomic writes to two
+        /// different stores.
+        #[derive(Default)]
+        struct FakeState {
+            metadata: Option<HashMap<String, AttributeValue>>,
+            object: Option<Vec<u8>>,
+            associations: HashSet<String>,
+            uploads: usize,
+            /// Pairs observed at the moment metadata was about to be written, which is exactly
+            /// what a concurrent reader of that hash would have seen.
+            observed: Vec<(Option<Vec<u8>>, Option<Fragment>)>,
+            /// When set, the next metadata write fails, standing in for the throttling or crash
+            /// that the store already expects between these two writes.
+            fail_next_metadata_write: bool,
+        }
+
+        impl FakeState {
+            fn published(&self) -> Option<Fragment> {
+                self.metadata.as_ref().and_then(|row| {
+                    serde_dynamo::from_item::<_, FragmentMetadataEntry>(row.clone())
+                        .ok()
+                        .and_then(|entry| entry.fragment)
+                })
+            }
+        }
+
+        fn association_key(item: &HashMap<String, AttributeValue>) -> String {
+            format!("{:?}", item.get(FRAGMENTS_DYNAMO_SORT_KEY_ATTRIBUTE))
+        }
+
+        /// Writer `index`'s representation of the shared content: a distinct codec, a distinct
+        /// compressed length, and bytes that identify which writer produced them.
+        fn representation(index: u8) -> (Fragment, Bytes) {
+            let len = BASE_PAYLOAD_LEN + usize::from(index);
+            let codec = match index % 3 {
+                0 => FragmentFlags::PayloadCompressedLZ4,
+                1 => FragmentFlags::PayloadCompressedZstd,
+                _ => FragmentFlags::PayloadCompressedOodle2,
+            };
+
+            let fragment = Fragment {
+                flags: codec.bits(),
+                size_payload: len as u32,
+                size_content: CONTENT_SIZE,
+            };
+
+            (fragment, Bytes::from(vec![index; len]))
+        }
+
+        /// Describe how a stored blob and a published fragment disagree, or `None` if they match.
+        ///
+        /// A reader fetches the two independently and fails if they do not line up, so any
+        /// disagreement here is a read that cannot succeed.
+        fn disagreement(object: Option<&Vec<u8>>, published: Option<Fragment>) -> Option<String> {
+            let published = published?;
+            let Some(object) = object else {
+                return Some("metadata is published with no blob in S3".to_string());
+            };
+
+            if published.size_payload as usize != object.len() {
+                return Some(format!(
+                    "published size_payload {} does not match the stored blob length {}",
+                    published.size_payload,
+                    object.len()
+                ));
+            }
+
+            let writer = object[0];
+            let (expected, _) = representation(writer);
+
+            if published.flags != expected.flags {
+                return Some(format!(
+                    "writer {writer}'s blob is published with flags {:#x} instead of {:#x}",
+                    published.flags, expected.flags
+                ));
+            }
+
+            None
+        }
+
+        async fn fake_store(state: Arc<Mutex<FakeState>>) -> Arc<AwsImmutableStore> {
+            let mut dynamodb = MockDynamoDb::default();
+            let mut s3 = MockS3Impl::default();
+
+            let get_state = state.clone();
+            dynamodb
+                .expect_get_item()
+                .returning(move |table, key, _consistent| {
+                    let state = get_state.lock().unwrap();
+                    let item = if table.as_ref() == METADATA_TABLE_NAME {
+                        state.metadata.clone()
+                    } else if state.associations.contains(&association_key(&key)) {
+                        Some(key)
+                    } else {
+                        None
+                    };
+
+                    Ok(GetItemOutput::builder().set_item(item).build())
+                });
+
+            let put_state = state.clone();
+            dynamodb.expect_put_item().returning(move |table, item| {
+                let mut state = put_state.lock().unwrap();
+
+                if table.as_ref() == METADATA_TABLE_NAME {
+                    // Record what a reader would have seen in the gap between the object being
+                    // replaced and its description catching up.
+                    let observed = (state.object.clone(), state.published());
+                    state.observed.push(observed);
+
+                    if state.fail_next_metadata_write {
+                        state.fail_next_metadata_write = false;
+
+                        return Err(aws_error(
+                            PutItemError::ProvisionedThroughputExceededException(
+                                ProvisionedThroughputExceededException::builder().build(),
+                            ),
+                            400u16,
+                        ));
+                    }
+
+                    state.metadata = Some(item);
+                } else {
+                    state.associations.insert(association_key(&item));
+                }
+
+                Ok(PutItemOutput::builder().build())
+            });
+
+            let read_state = state.clone();
+            s3.expect_get_object()
+                .returning(move |_bucket, _key, _range| {
+                    let object = read_state.lock().unwrap().object.clone();
+
+                    Ok(GetObjectOutput::builder()
+                        .set_body(object.map(Into::into))
+                        .build())
+                });
+
+            let upload_state = state.clone();
+            s3.expect_put_object::<Vec<u8>>()
+                .returning(move |_bucket, _key, body| {
+                    let mut state = upload_state.lock().unwrap();
+                    state.object = Some(body);
+                    state.uploads += 1;
+
+                    Ok(PutObjectOutput::builder().build())
+                });
+
+            Arc::new(initialize_immutable_store(s3, dynamodb).await)
+        }
+
+        async fn store_representation(
+            store: Arc<AwsImmutableStore>,
+            shared: Address,
+            index: u8,
+        ) -> Result<(), StoreError> {
+            let (fragment, payload) = representation(index);
+
+            store
+                .put(
+                    random::<Partition>(),
+                    address_with_random_context(shared),
+                    fragment,
+                    Some(payload),
+                    false,
+                )
+                .await
+        }
+
+        /// Case 1: writers on different partitions storing the same content in different
+        /// representations. The object and its description are written separately, so the writer
+        /// that wins S3 need not be the writer that wins DynamoDB.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn concurrent_cross_partition_writers_tear_blob_and_metadata() {
+            for iteration in 0..512 {
+                let state = Arc::new(Mutex::new(FakeState::default()));
+                let store = fake_store(state.clone()).await;
+                let (_, shared, _) = fragment::generate_random();
+
+                let mut writers = JoinSet::new();
+                for index in 0..WRITERS {
+                    let store = store.clone();
+                    lore_base::lore_spawn!(writers, store_representation(store, shared, index));
+                }
+
+                while let Some(writer) = writers.join_next().await {
+                    writer.expect("writer panicked").expect("put failed");
+                }
+
+                let state = state.lock().unwrap();
+                if let Some(torn) = disagreement(state.object.as_ref(), state.published()) {
+                    panic!("iteration {iteration}: {torn}");
+                }
+            }
+        }
+
+        /// Case 2: a second partition storing content that is already stored replaces the blob
+        /// the first partition is using, and the two writes that do it are not tied together.
+        /// Losing the second one — a throttled DynamoDB write, which this store already expects
+        /// between them — leaves the first partition reading a blob its own metadata no longer
+        /// describes.
+        ///
+        /// Nothing here is concurrent. One partition stores content, another stores the same
+        /// content compressed differently, and the first partition can no longer read what it
+        /// stored.
+        #[tokio::test]
+        async fn a_failed_cross_partition_write_corrupts_the_first_partition() {
+            let state = Arc::new(Mutex::new(FakeState::default()));
+            let store = fake_store(state.clone()).await;
+            let (_, shared, _) = fragment::generate_random();
+
+            // The first partition stores the content and can read it back.
+            let first_partition = random::<Partition>();
+            let first_address = address_with_random_context(shared);
+            let (first_fragment, first_payload) = representation(0);
+
+            store
+                .clone()
+                .put(
+                    first_partition,
+                    first_address,
+                    first_fragment,
+                    Some(first_payload.clone()),
+                    false,
+                )
+                .await
+                .expect("the first partition should store the content");
+
+            store
+                .clone()
+                .get(first_partition, first_address, StoreMatch::MatchFull)
+                .await
+                .expect("the first partition should be able to read what it stored");
+
+            // A second partition stores the same content compressed differently. Its upload
+            // lands; its metadata write is throttled away.
+            state.lock().unwrap().fail_next_metadata_write = true;
+
+            let second_result = store_representation(store.clone(), shared, 1).await;
+            assert!(
+                second_result.is_err(),
+                "the second partition's write was supposed to fail on its metadata write"
+            );
+
+            // The first partition never wrote again, yet the blob under its hash is now the
+            // second partition's while its published metadata still describes its own. That the
+            // read breaks at all is itself proof the blob was replaced: had the second partition
+            // not re-uploaded content that was already stored, there would be nothing to break.
+            store
+                .clone()
+                .get(first_partition, first_address, StoreMatch::MatchFull)
+                .await
+                .expect(
+                    "the first partition can no longer read the content it stored: its blob and \
+                     metadata no longer describe each other",
+                );
+
+            // Nor can it repair itself: its own re-put matches on the association and returns
+            // without writing anything.
+            store
+                .clone()
+                .put(
+                    first_partition,
+                    first_address,
+                    first_fragment,
+                    Some(first_payload),
+                    false,
+                )
+                .await
+                .expect("re-storing the content should succeed");
+
+            store
+                .get(first_partition, first_address, StoreMatch::MatchFull)
+                .await
+                .expect("re-storing the content should have repaired the read");
+        }
+    }
+
     #[tokio::test]
     async fn test_exists_batch_full_match() {
         let repository = random::<Context>();
