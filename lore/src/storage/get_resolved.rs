@@ -3,16 +3,31 @@
 //! `lore_storage_get_resolved` — `lore_storage_mutable_load` + `lore_storage_get` performed
 //! server-side, saving one round trip.
 //!
-//! Per-item event sequence, identical to `lore_storage_get`:
+//! Per-item event sequence in single-buffer mode (`streaming=0`), identical to
+//! `lore_storage_get`:
 //! - `GET_HEADER { id, address, size_content }`
 //! - `GET_DATA { id, address, offset: 0, bytes }`
 //! - `GET_ITEM_COMPLETE { id, address, error_code }`
 //!
+//! In streaming mode (`streaming=1`) the single `GET_DATA` is replaced by one event per leaf
+//! fragment with an advancing `offset`, so peak memory follows the fragment size rather than the
+//! content size. `GET_HEADER` still precedes the data, but it follows the resolve — unlike
+//! `lore_storage_get`, the address is not known until the key resolves. A failure partway through
+//! the tree ends the data early and reports its own code on `GET_ITEM_COMPLETE`, with a
+//! byte-count check against `size_content` as a backstop, so a partial delivery is never
+//! reported as success.
+//!
 //! `address` is the resolved address (`{ resolved_hash, context }`), so callers may cache the
 //! key->hash mapping from the event stream.
 //!
-//! Remote-only: a handle without a remote session rejects with `INVALID_ARGUMENTS`. A missing
-//! key, or one resolving to absent content, yields `ADDRESS_NOT_FOUND`.
+//! Keys are always resolved as `KeyType::Resolve`, so no key type is supplied. The QUIC request
+//! carries a `flags` word to keep its length a multiple of four, but no bit is defined and the
+//! value is not a caller's to choose, so it is not part of the item — the server rejects a
+//! non-zero value from any peer that sends one.
+//!
+//! Backend selection matches `lore_storage_get`: local first, remote on a miss, narrowed by the
+//! handle's bound and per-call `offline`/`local`/`remote` flags. A missing key, or one resolving
+//! to absent content, yields `ADDRESS_NOT_FOUND`.
 
 use std::sync::Arc;
 
@@ -22,7 +37,6 @@ use lore_base::lore_spawn;
 use lore_base::types::Address;
 use lore_base::types::Context;
 use lore_base::types::Hash;
-use lore_base::types::KeyType;
 use lore_base::types::Partition;
 use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
@@ -38,6 +52,8 @@ use lore_revision::store::event::LoreStorageGetDataEventData;
 use lore_revision::store::event::LoreStorageGetHeaderEventData;
 use lore_revision::store::event::LoreStorageGetItemCompleteEventData;
 use lore_storage::read::read_resolved;
+use lore_storage::read::read_resolved_stream;
+use lore_transport::quic::storage_service::get_resolved_flags;
 use serde::Deserialize;
 use serde::Serialize;
 use tokio::task::JoinSet;
@@ -58,28 +74,28 @@ pub struct LoreStorageGetResolvedItem {
     /// Partition to resolve and read within; the zero/default partition rejects with
     /// `INVALID_ARGUMENTS`
     pub partition: Partition,
-    /// Mutable key to resolve
+    /// Mutable key to resolve, always read as `KeyType::Resolve`
     pub key: Hash,
-    /// Kind of value the key refers to
-    pub key_type: KeyType,
     /// Paired with the resolved hash to address the immutable read; the mutable store yields
     /// only a hash.
     pub context: Context,
+    /// Stream one `GET_DATA` per leaf fragment instead of a single reassembled buffer, as
+    /// `lore_storage_get` does. Peak memory then follows the fragment size rather than the
+    /// content size, which is what makes a key naming something large usable. A read that fails
+    /// partway reports the failure on `GET_ITEM_COMPLETE` rather than ending short with a
+    /// success code
+    pub streaming: u8,
     /// Cache fetched bytes back to the local store even without the producer's
     /// `PayloadLocalCachePriority` hint
     pub local_cache: u8,
-    /// Reserved bitmask forwarded to the server, low 24 bits only; 0 for default behaviour.
-    /// Unknown bits are rejected.
-    pub flags: u32,
 }
 
 impl core::fmt::Debug for LoreStorageGetResolvedItem {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("LoreStorageGetResolvedItem")
             .field("id", &self.id)
-            .field("key_type", &self.key_type)
+            .field("streaming", &self.streaming)
             .field("local_cache", &self.local_cache)
-            .field("flags", &self.flags)
             .finish()
     }
 }
@@ -146,8 +162,7 @@ async fn get_resolved_local(
             let mut reuse = crate::storage::store::SessionReuse::default();
             let mut tasks: JoinSet<LoreErrorCode> = JoinSet::new();
             for item in items {
-                // Always request a remote session: resolution is server-side by definition.
-                let session = reuse.session_for(&store, item.partition, true);
+                let session = reuse.session_for(&store, item.partition, !effective.no_remote);
                 let store = store.clone();
                 lore_spawn!(tasks, async move {
                     get_resolved_item(store, item, effective, session).await
@@ -179,27 +194,25 @@ async fn get_resolved_item(
         return LoreErrorCode::InvalidArguments;
     }
 
-    // Resolution happens on the server, so this call is meaningless without a remote session.
-    let Some(session) = remote_session else {
-        emit_item_complete(&item, Address::default(), LoreErrorCode::InvalidArguments);
-        return LoreErrorCode::InvalidArguments;
-    };
-
-    let mut read_options = effective.read_options(true);
+    let mut read_options = effective.read_options(remote_session.is_some());
     if item.local_cache != 0 {
         read_options = read_options.with_cache();
     }
 
+    if item.streaming != 0 {
+        return get_resolved_item_streaming(store, item, read_options, remote_session).await;
+    }
+
     match read_resolved(
         store.immutable.clone(),
+        store.mutable.clone(),
         item.partition,
         item.key,
-        item.key_type,
         item.context,
-        item.flags,
+        get_resolved_flags::NONE,
         None,
         read_options,
-        session,
+        remote_session,
     )
     .await
     {
@@ -220,6 +233,66 @@ async fn get_resolved_item(
             code
         }
     }
+}
+
+/// Streaming counterpart of [`get_resolved_item`]: one `GET_DATA` per leaf instead of a single
+/// reassembled buffer, mirroring `get`'s streaming worker. The resolved address is not known
+/// until the key resolves, so `GET_HEADER` follows the resolve rather than preceding it.
+async fn get_resolved_item_streaming(
+    store: Arc<StoreInternal>,
+    item: LoreStorageGetResolvedItem,
+    read_options: lore_storage::options::ReadOptions,
+    remote_session: Option<Arc<lore_transport::StorageSession>>,
+) -> LoreErrorCode {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<Bytes, lore_storage::StorageError>>(256);
+    let stream_future = read_resolved_stream(
+        store.immutable.clone(),
+        store.mutable.clone(),
+        item.partition,
+        item.key,
+        item.context,
+        get_resolved_flags::NONE,
+        read_options,
+        tx,
+        remote_session,
+    );
+
+    let (resolved, size_content) = match stream_future.await {
+        Ok(result) => result,
+        Err(err) => {
+            let code = crate::storage::storage_error_to_code(&err);
+            emit_item_complete(&item, Address::default(), code);
+            return code;
+        }
+    };
+
+    let address = Address {
+        hash: resolved,
+        context: item.context,
+    };
+    emit_header(&item, address, size_content);
+
+    let mut offset: u64 = 0;
+    let mut code = LoreErrorCode::None;
+    while let Some(chunk) = rx.recv().await {
+        match chunk {
+            Ok(chunk) => {
+                let len = chunk.len() as u64;
+                emit_data(&item, address, chunk, offset);
+                offset += len;
+            }
+            Err(err) => {
+                code = crate::storage::storage_error_to_code(&err);
+                break;
+            }
+        }
+    }
+
+    if code == LoreErrorCode::None && offset != size_content {
+        code = LoreErrorCode::Internal;
+    }
+    emit_item_complete(&item, address, code);
+    code
 }
 
 fn emit_header(item: &LoreStorageGetResolvedItem, address: Address, size_content: u64) {
