@@ -145,6 +145,7 @@ pub async fn handler(
                                     {
                                         Ok(LoreResponse::Put(_)) => Ok(storage_v1::PutResponse {
                                             address: Some(address.into()),
+                                            status: None,
                                         }),
                                         Ok(_) => Err(Status::internal(
                                             "Put handler returned the wrong response type",
@@ -177,6 +178,22 @@ pub async fn handler(
                                 ],
                             );
 
+                            // Carry the outcome in-band. A `Status` here would end the stream,
+                            // and every other fragment in flight on it would wait for a response
+                            // that can no longer arrive — a failed fragment must fail itself, not
+                            // the batch. `Err` is reserved for a request we cannot correlate,
+                            // where there is no address to report against.
+                            let response = match (response, put_address) {
+                                (Ok(response), _) => Ok(response),
+                                (Err(status), Some(address)) => Ok(storage_v1::PutResponse {
+                                    address: Some(address.into()),
+                                    status: Some(lore_proto::lore::model::v1::ItemStatus {
+                                        code: status.code() as i32,
+                                        message: status.message().to_string(),
+                                    }),
+                                }),
+                                (Err(status), None) => Err(status),
+                            };
                             if let Err(err) = tx.send(response).await {
                                 debug!(address = ?put_address, "Error sending put response: {err}");
                             }

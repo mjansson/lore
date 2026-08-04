@@ -85,6 +85,10 @@ message PutRequest {
 
 message PutResponse {
     lore.model.v1.Address address = 1;
+    // This item's outcome; absent or code 0 (OK) means the fragment was stored. Carried in-band
+    // because a `Status` on a streaming response ends the stream, which would strand every other
+    // fragment in flight on it rather than failing the one that went wrong.
+    lore.model.v1.ItemStatus status = 2;
 }
 
 message QueryRequest {

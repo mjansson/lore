@@ -139,6 +139,11 @@ impl ::prost::Name for PutRequest {
 pub struct PutResponse {
     #[prost(message, optional, tag = "1")]
     pub address: ::core::option::Option<crate::lore::model::v1::Address>,
+    /// This item's outcome; absent or code 0 (OK) means the fragment was stored. Carried in-band
+    /// because a `Status` on a streaming response ends the stream, which would strand every other
+    /// fragment in flight on it rather than failing the one that went wrong.
+    #[prost(message, optional, tag = "2")]
+    pub status: ::core::option::Option<crate::lore::model::v1::ItemStatus>,
 }
 impl ::prost::Name for PutResponse {
     const NAME: &'static str = "PutResponse";

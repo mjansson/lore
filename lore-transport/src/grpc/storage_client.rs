@@ -1226,9 +1226,16 @@ impl StorageService {
                             let address = Address::from(address);
                             let senders = inflight.remove(&address);
                             if let Some((_, senders)) = senders {
+                                // A per-item failure now arrives in-band, so the stream is still
+                                // alive and every other fragment on it is unaffected.
+                                let item_error = item_status_error(response.status.as_ref());
                                 let response = Arc::new(response);
                                 for sender in senders {
-                                    let _ = sender.send(Ok(response.clone())).map_err(|err| {
+                                    let outcome = match &item_error {
+                                        Some(err) => Err(err.clone()),
+                                        None => Ok(response.clone()),
+                                    };
+                                    let _ = sender.send(outcome).map_err(|err| {
                                         lore_error!("Put request failed sending response to requestor: {err:?}");
                                     });
                                 }
@@ -1259,6 +1266,20 @@ impl StorageService {
                             } else {
                                 lore_error!("Put request failed and no address details found: {e}");
                             }
+                        }
+                    }
+                }
+
+                // The stream is gone; nothing further can arrive. Anything still waiting would
+                // otherwise wait forever — a hang rather than an error, and the reason a single
+                // rejected fragment used to strand a whole fragmented upload.
+                let stranded: Vec<Address> = inflight.iter().map(|entry| *entry.key()).collect();
+                for address in stranded {
+                    if let Some((_, senders)) = inflight.remove(&address) {
+                        for sender in senders {
+                            let _ = sender.send(Err(ProtocolError::internal(format!(
+                                "put: response stream ended before {address} was answered"
+                            ))));
                         }
                     }
                 }

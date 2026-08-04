@@ -60,6 +60,154 @@ mod storage_remote_tests {
         _shutdown: Box<dyn std::any::Any + Send>,
     }
 
+
+    /// A server-side store that refuses to store exactly one leaf fragment.
+    ///
+    /// Everything else delegates, so a fragmented upload lands with every leaf present but one —
+    /// the mixed tree that tells an intersection fold apart from a union. Without this the suite
+    /// only ever has all leaves succeed or all fail, and those two cases give the same answer
+    /// either way.
+    struct RejectOneLeafStore {
+        inner: Arc<dyn lore_storage::ImmutableStore>,
+        leaf_size: u64,
+        rejected: std::sync::atomic::AtomicUsize,
+    }
+    
+    #[async_trait::async_trait]
+    impl lore_storage::ImmutableStore for RejectOneLeafStore {
+        fn is_local(&self) -> bool {
+            self.inner.clone().is_local()
+        }
+
+        async fn exist(
+            self: Arc<Self>,
+            partition: lore_base::types::Partition,
+            address: lore_base::types::Address,
+            match_requested: lore_storage::store_types::StoreMatch,
+        ) -> Result<lore_storage::store_types::StoreMatch, lore_storage::immutable_store::StoreError> {
+            self.inner
+                .clone()
+                .exist(partition, address, match_requested)
+                .await
+        }
+
+        async fn exist_batch(
+            self: Arc<Self>,
+            partition: lore_base::types::Partition,
+            addresses: &[lore_base::types::Address],
+            match_requested: lore_storage::store_types::StoreMatch,
+        ) -> Result<Vec<lore_storage::store_types::StoreMatch>, lore_storage::immutable_store::StoreError> {
+            self.inner
+                .clone()
+                .exist_batch(partition, addresses, match_requested)
+                .await
+        }
+
+        async fn query(
+            self: Arc<Self>,
+            partition: lore_base::types::Partition,
+            address: lore_base::types::Address,
+            match_requested: lore_storage::store_types::StoreMatch,
+        ) -> Result<lore_storage::store_types::StoreQueryResult, lore_storage::immutable_store::StoreError> {
+            self.inner
+                .clone()
+                .query(partition, address, match_requested)
+                .await
+        }
+
+        async fn get(
+            self: Arc<Self>,
+            partition: lore_base::types::Partition,
+            address: lore_base::types::Address,
+            match_required: lore_storage::store_types::StoreMatch,
+        ) -> Result<(lore_base::types::Fragment, bytes::Bytes), lore_storage::immutable_store::StoreError> {
+            self.inner
+                .clone()
+                .get(partition, address, match_required)
+                .await
+        }
+
+        async fn put(
+            self: Arc<Self>,
+            partition: lore_base::types::Partition,
+            address: lore_base::types::Address,
+            fragment: lore_base::types::Fragment,
+            payload: Option<bytes::Bytes>,
+            force: bool,
+        ) -> Result<(), lore_storage::immutable_store::StoreError> {
+            // Reject exactly one leaf. Leaves carry a full chunk of content; the fragment list
+            // that roots them does not, so keying on the size picks a leaf without having to
+            // predict which one wins the race to upload first.
+            if fragment.size_content == self.leaf_size
+                && self.rejected.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0
+            {
+                return Err(lore_storage::immutable_store::StoreError::internal("rejected one leaf on purpose"));
+            }
+            self.inner
+                .clone()
+                .put(partition, address, fragment, payload, force)
+                .await
+        }
+
+        async fn obliterate(
+            self: Arc<Self>,
+            partition: lore_base::types::Partition,
+            address: lore_base::types::Address,
+            stats: Arc<lore_storage::store_types::StoreObliterateStats>,
+        ) -> Result<(), lore_storage::immutable_store::StoreError> {
+            self.inner
+                .clone()
+                .obliterate(partition, address, stats)
+                .await
+        }
+
+        async fn evict(
+            self: Arc<Self>,
+            max_capacity: usize,
+            sync_data: bool,
+            sink: Option<lore_storage::gc_event::GcEventSinkRef>,
+        ) -> Result<usize, lore_storage::immutable_store::StoreError> {
+            self.inner
+                .clone()
+                .evict(max_capacity, sync_data, sink)
+                .await
+        }
+
+        async fn compact(
+            self: Arc<Self>,
+            max_size: usize,
+            at: Option<usize>,
+            sync_data: bool,
+            sink: Option<lore_storage::gc_event::GcEventSinkRef>,
+        ) -> Result<Option<usize>, lore_storage::immutable_store::StoreError> {
+            self.inner
+                .clone()
+                .compact(max_size, at, sync_data, sink)
+                .await
+        }
+
+        async fn compact_resume_at(self: Arc<Self>) -> Option<usize> {
+            self.inner.clone().compact_resume_at().await
+        }
+
+        async fn compact_stop(self: Arc<Self>) {
+            self.inner.clone().compact_stop().await;
+        }
+
+        fn max_query_batch(&self) -> Option<usize> {
+            None
+        }
+
+        async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), lore_storage::immutable_store::StoreError> {
+            self.inner.clone().flush(sync_data).await
+        }
+
+        async fn verify(self: Arc<Self>, heal: bool) -> Result<(), lore_storage::immutable_store::StoreError> {
+            self.inner.clone().verify(heal).await
+        }
+    }
+
+
     /// Start a server speaking `transport`, backed by fresh in-memory stores.
     async fn start_server(transport: Transport) -> TestServer {
         match transport {
@@ -184,6 +332,92 @@ mod storage_remote_tests {
             _shutdown: Box::new(shutdown_tx),
         }
     }
+
+    /// A gRPC server whose immutable store refuses exactly one leaf of `leaf_size` bytes.
+    ///
+    /// `backend_immutable` on the returned handle is the *inner* store, so assertions see what
+    /// actually landed rather than the refusing wrapper.
+    async fn start_server_rejecting_one_leaf(leaf_size: u64) -> TestServer {
+        let backend_immutable = lore_storage::local::immutable_store::create(
+            None::<&str>,
+            ImmutableStoreCreateOptions::none(),
+            false,
+            ImmutableStoreSettings {
+                allow_partial_fragment: false,
+                protect_local_fragment: false,
+                implicit_durable_stored: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let backend_mutable = lore_storage::local::mutable_store::create(
+            None::<&str>,
+            lore_storage::MutableStoreSettings::default(),
+            backend_immutable.clone(),
+        )
+        .await
+        .unwrap();
+        let backend_for_test = backend_immutable.clone();
+        let backend_immutable: Arc<dyn lore_storage::ImmutableStore> =
+            Arc::new(RejectOneLeafStore {
+                inner: backend_immutable,
+                leaf_size,
+                rejected: std::sync::atomic::AtomicUsize::new(0),
+            });
+        let backend_mutable_for_test: Arc<dyn lore_storage::MutableStore> = backend_mutable.clone();
+
+        let addr = reserve_port().await;
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let signal = async {
+            shutdown_rx.await.ok();
+        };
+
+        let notification_sender: Arc<dyn lore_revision::notification::NotificationSender> =
+            Arc::new(lore_server::notification::local::NotificationSender::default());
+        let hook_dispatcher = Arc::new(HookDispatcher::empty());
+
+        // Background server task in a test; LORE_CONTEXT propagation is unnecessary here.
+        #[allow(clippy::disallowed_methods)]
+        tokio::spawn(async move {
+            GrpcServerBuilder::new()
+                .with_environment(EnvironmentConfig::default())
+                .with_feature(FeatureSettings::default())
+                .with_immutable_store(backend_immutable.clone(), backend_immutable)
+                .with_mutable_store(backend_mutable)
+                .with_lock_store(None)
+                .with_notification(notification_sender, None)
+                .with_hook_dispatcher(hook_dispatcher)
+                .with_tls_config(None, None, None)
+                .unwrap()
+                .with_admin_endpoints(HashMap::new(), vec![])
+                .with_http2_config(
+                    None,
+                    None,
+                    Duration::from_secs(30),
+                    None,
+                    Default::default(),
+                    None,
+                )
+                .with_jwt_verifier(None)
+                .unwrap()
+                .serve(addr, signal)
+                .await
+                .unwrap();
+        });
+
+        await_listening(addr).await;
+
+        TestServer {
+            url: format!("grpc://127.0.0.1:{}", addr.port()),
+            backend_immutable: backend_for_test,
+            backend_mutable: backend_mutable_for_test,
+            _shutdown: Box::new(shutdown_tx),
+        }
+    }
+
 
     /// A `lore://` server: QUIC for storage, gRPC for everything else.
     ///
@@ -4183,6 +4417,107 @@ mod storage_remote_tests {
     /// Content large enough to fragment takes a different route: the leaves upload through the
     /// ordinary write path and the key follows as a separate mapping write, gated on every
     /// fragment having reached the remote. `fixed_size_chunk` forces many small leaves so the
+    /// One leaf that fails to upload makes the whole tree not-remote, and the key stays
+    /// unpublished.
+    ///
+    /// `write_fragmented` folds each leaf's placement with `&=`, and `write_resolved` gates the
+    /// remote publish on the result. Fold with a union instead and this tree reports remote, the
+    /// key is published, and it names content the server only partly holds — a reader resolves
+    /// it, gets the root, and dies on the missing leaf.
+    ///
+    /// Every other placement test has all leaves succeed or all fail, and those two cases give
+    /// the same answer under either fold. This is the only mixed tree in the suite, so it is the
+    /// only test that can tell them apart.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn one_failed_leaf_makes_the_tree_not_remote_and_withholds_the_key() -> TestResult {
+        use lore::storage::put_resolved;
+        use lore::storage::put_resolved::LoreStoragePutResolvedArgs;
+        use lore::storage::put_resolved::LoreStoragePutResolvedItem;
+        use lore_base::types::Context;
+        use lore_base::types::Hash;
+        use lore_base::types::KeyType;
+        use lore_base::types::Partition;
+        use lore_revision::event::LoreBytes;
+        use lore_revision::event::LoreErrorCode;
+        use lore_revision::interface::LoreArray;
+
+        const CHUNK: u64 = 64 * 1024;
+
+        let execution = setup_execution("storage-remote-partial-tree".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let server = start_server_rejecting_one_leaf(CHUNK).await;
+                let partition = Partition::from([0xe4u8; 16]);
+                let key = Hash::hash_buffer(b"partial-tree-key");
+                let payload: Vec<u8> = (0..(CHUNK as u32 * 6)).map(|i| (i % 251) as u8).collect();
+                let handle_id = open_remote_handle(&server).await;
+
+                let outs: Arc<Mutex<Vec<(LoreErrorCode, u8)>>> = Arc::new(Mutex::new(Vec::new()));
+                let cb = outs.clone();
+                let callback: LoreEventCallback = Some(Box::new(move |e: &LoreEvent| {
+                    if let LoreEvent::StoragePutItemComplete(d) = e {
+                        cb.lock().unwrap().push((d.error_code, d.stored_remote));
+                    }
+                }));
+                put_resolved::put_resolved(
+                    LoreGlobalArgs::default(),
+                    LoreStoragePutResolvedArgs {
+                        handle: lore::storage::handle::LoreStore { handle_id },
+                        items: LoreArray::from_vec(vec![LoreStoragePutResolvedItem {
+                            id: 1,
+                            partition,
+                            key,
+                            context: Context::default(),
+                            data: LoreBytes {
+                                ptr: payload.as_ptr().cast(),
+                                len: payload.len(),
+                            },
+                            remote_write: 1,
+                            local_cache: 0,
+                            fixed_size_chunk: CHUNK,
+                        }]),
+                    },
+                    callback,
+                )
+                .await;
+
+                let outcomes = outs.lock().unwrap().clone();
+                assert_eq!(outcomes.len(), 1, "one item, one completion");
+                let (code, stored_remote) = outcomes[0];
+                assert_eq!(
+                    code,
+                    LoreErrorCode::None,
+                    "a failed upload still leaves a good local write, as `put` contracts",
+                );
+                assert_eq!(
+                    stored_remote, 0,
+                    "a tree missing one leaf on the remote must not report remote placement",
+                );
+
+                // The claim `stored_remote = 0` makes is that the key was withheld. Check the
+                // server's own mutable store rather than a read, which local state could satisfy.
+                // Unpublished shows up either way depending on whether the key was ever
+                // written: absent reads as `AddressNotFound`, retracted reads as the zero hash.
+                let resolved = server
+                    .backend_mutable
+                    .clone()
+                    .load(partition, key, KeyType::Resolve)
+                    .await;
+                let published = match resolved {
+                    Ok(hash) => !hash.is_zero(),
+                    Err(_) => false,
+                };
+                assert!(
+                    !published,
+                    "the key must not be published while its content is only partly on the \
+                     server; found {resolved:?}",
+                );
+
+                Ok(())
+            })
+            .await
+    }
+
     /// aggregate is over a real tree rather than a single fragment.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn put_resolved_publishes_fragmented_content() -> TestResult {
