@@ -6,6 +6,7 @@
 # Local files
 lore-server/config/local*.toml
 **/.grafana.local.yaml
+/context/
 
 #################
 ## Visual Studio
