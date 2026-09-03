@@ -11009,3 +11009,195 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod lock_scale_bench {
+    //! Measures the tree-read costs the successor-locks design rests on.
+    //!
+    //! The design addresses a file by node id and claims that resolving one costs
+    //! a single node-block read whatever the file's depth or its directory's
+    //! width, against a path walk whose cost grows with both. It also assumes no
+    //! locality between the entries of one request. Both are claims about a real
+    //! tree, and neither is measurable without one.
+    //!
+    //! ```text
+    //! cargo test --release -p lore-revision lock_scale -- --ignored --nocapture
+    //! ```
+    use std::collections::HashSet;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use std::time::Instant;
+
+    use crate::node::Node;
+    use crate::node::NodeBlock;
+    use crate::node::NodeFlags;
+    use crate::node::NodeID;
+    use crate::node::ROOT_NODE;
+    use crate::repository::RepositoryContext;
+    use crate::state::State;
+
+    /// Tree shape to build. `wide` puts every file in one directory, the large
+    /// flat asset folder the design says path resolution handles worst.
+    struct Shape {
+        label: &'static str,
+        dirs: usize,
+        depth: usize,
+    }
+
+    const SHAPES: &[Shape] = &[
+        Shape { label: "one flat directory", dirs: 1, depth: 1 },
+        Shape { label: "256 directories, depth 4", dirs: 256, depth: 4 },
+    ];
+
+    async fn null_repository() -> Arc<RepositoryContext> {
+        let immutable_store = lore_storage::local::immutable_store::create(
+            None::<&str>,
+            lore_storage::local::immutable_store::ImmutableStoreCreateOptions::none(),
+            false,
+            lore_storage::ImmutableStoreSettings::default(),
+        )
+        .await
+        .expect("in-memory immutable store");
+        let mutable_store = lore_storage::local::mutable_store::create(
+            None::<&str>,
+            lore_storage::MutableStoreSettings::default(),
+            immutable_store.clone(),
+        )
+        .await
+        .expect("in-memory mutable store");
+        Arc::new(RepositoryContext::new_null_context(
+            immutable_store,
+            mutable_store,
+        ))
+    }
+
+    async fn with_execution<F: std::future::Future>(body: F) -> F::Output {
+        let execution = Arc::new(crate::interface::ExecutionContext::new_client(
+            crate::interface::LoreGlobalArgs::default(),
+            crate::relay::EventDispatcher::no_dispatch(),
+        ));
+        lore_base::runtime::LORE_CONTEXT.scope(execution, body).await
+    }
+
+    /// Build the tree, returning every file's node id and path in creation order.
+    async fn build(
+        state: &Arc<State>,
+        repository: &Arc<RepositoryContext>,
+        shape: &Shape,
+        entries: usize,
+    ) -> (Vec<NodeID>, Vec<String>) {
+        let mut dir_nodes = Vec::with_capacity(shape.dirs);
+        let mut dir_paths = Vec::with_capacity(shape.dirs);
+        for d in 0..shape.dirs {
+            let mut parent = ROOT_NODE;
+            let mut path = String::new();
+            for level in 0..shape.depth {
+                let name = format!("d{d}_{level}");
+                // The caller sets the name hash before `node_add`, as the
+                // staging path does; lookup matches on it.
+                let node = Node {
+                    flags: NodeFlags::NoFlags.bits(),
+                    name_hash: crate::hash::hash_string(&name),
+                    ..Default::default()
+                };
+                parent = state
+                    .node_add(repository.clone(), parent, node, &name)
+                    .await
+                    .expect("add directory");
+                if !path.is_empty() {
+                    path.push('/');
+                }
+                path.push_str(&name);
+            }
+            dir_nodes.push(parent);
+            dir_paths.push(path);
+        }
+
+        let mut nodes = Vec::with_capacity(entries);
+        let mut paths = Vec::with_capacity(entries);
+        for i in 0..entries {
+            let bucket = i % shape.dirs;
+            let name = format!("asset_{i}.uasset");
+            let node = Node {
+                flags: NodeFlags::File.bits(),
+                name_hash: crate::hash::hash_string(&name),
+                ..Default::default()
+            };
+            let id = state
+                .node_add(repository.clone(), dir_nodes[bucket], node, &name)
+                .await
+                .expect("add file");
+            nodes.push(id);
+            paths.push(format!("{}/{}", dir_paths[bucket], name));
+        }
+        (nodes, paths)
+    }
+
+    fn per(total: Duration, n: usize) -> Duration {
+        total / (n.max(1) as u32)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "measurement, not a test — run explicitly"]
+    async fn lock_scale() {
+        let entries: usize = std::env::var("LOCK_SCALE_ENTRIES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10_000);
+
+        with_execution(async move {
+            println!("\nsuccessor-locks tree-read costs, {entries} entries per shape\n");
+            for shape in SHAPES {
+                let repository = null_repository().await;
+                let state = Arc::new(State::new());
+                let (nodes, paths) = build(&state, &repository, shape, entries).await;
+
+                // Node-id resolution: what one acquisition entry costs.
+                let start = Instant::now();
+                for id in &nodes {
+                    state.node(repository.clone(), *id).await.expect("node by id");
+                }
+                let by_node = start.elapsed();
+
+                // Path resolution: what the same entry costs today.
+                let start = Instant::now();
+                for path in &paths {
+                    state
+                        .find_node_link(repository.clone(), path)
+                        .await
+                        .expect("node by path");
+                }
+                let by_path = start.elapsed();
+
+                // Distinct node blocks the set touches — what "no locality" claims.
+                let all: HashSet<usize> =
+                    nodes.iter().map(|id| NodeBlock::index(*id)).collect();
+                let sample: Vec<NodeID> = nodes.iter().copied().step_by(17).collect();
+                let scattered: HashSet<usize> =
+                    sample.iter().map(|id| NodeBlock::index(*id)).collect();
+
+                println!("{}", shape.label);
+                println!(
+                    "  by node id   {:>10.2?}   {:>9.2?} per entry",
+                    by_node,
+                    per(by_node, nodes.len())
+                );
+                println!(
+                    "  by path      {:>10.2?}   {:>9.2?} per entry   {:.1}x slower",
+                    by_path,
+                    per(by_path, paths.len()),
+                    by_path.as_secs_f64() / by_node.as_secs_f64().max(f64::EPSILON)
+                );
+                println!(
+                    "  blocks       {} for all {}, {} for a {}-entry scattered sample",
+                    all.len(),
+                    nodes.len(),
+                    scattered.len(),
+                    sample.len()
+                );
+                println!();
+            }
+        })
+        .await;
+    }
+}
