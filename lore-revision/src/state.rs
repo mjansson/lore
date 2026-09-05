@@ -11045,8 +11045,16 @@ mod lock_scale_bench {
     }
 
     const SHAPES: &[Shape] = &[
-        Shape { label: "one flat directory", dirs: 1, depth: 1 },
-        Shape { label: "256 directories, depth 4", dirs: 256, depth: 4 },
+        Shape {
+            label: "one flat directory",
+            dirs: 1,
+            depth: 1,
+        },
+        Shape {
+            label: "256 directories, depth 4",
+            dirs: 256,
+            depth: 4,
+        },
     ];
 
     async fn null_repository() -> Arc<RepositoryContext> {
@@ -11076,7 +11084,9 @@ mod lock_scale_bench {
             crate::interface::LoreGlobalArgs::default(),
             crate::relay::EventDispatcher::no_dispatch(),
         ));
-        lore_base::runtime::LORE_CONTEXT.scope(execution, body).await
+        lore_base::runtime::LORE_CONTEXT
+            .scope(execution, body)
+            .await
     }
 
     /// Build the tree, returning every file's node id and path in creation order.
@@ -11155,7 +11165,10 @@ mod lock_scale_bench {
                 // Node-id resolution: what one acquisition entry costs.
                 let start = Instant::now();
                 for id in &nodes {
-                    state.node(repository.clone(), *id).await.expect("node by id");
+                    state
+                        .node(repository.clone(), *id)
+                        .await
+                        .expect("node by id");
                 }
                 let by_node = start.elapsed();
 
@@ -11170,8 +11183,7 @@ mod lock_scale_bench {
                 let by_path = start.elapsed();
 
                 // Distinct node blocks the set touches — what "no locality" claims.
-                let all: HashSet<usize> =
-                    nodes.iter().map(|id| NodeBlock::index(*id)).collect();
+                let all: HashSet<usize> = nodes.iter().map(|id| NodeBlock::index(*id)).collect();
                 let sample: Vec<NodeID> = nodes.iter().copied().step_by(17).collect();
                 let scattered: HashSet<usize> =
                     sample.iter().map(|id| NodeBlock::index(*id)).collect();
