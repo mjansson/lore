@@ -11020,6 +11020,10 @@ mod lock_scale_bench {
     //! locality between the entries of one request. Both are claims about a real
     //! tree, and neither is measurable without one.
     //!
+    //! It also measures the reverse direction, node id to path, because that is
+    //! what a notification costs: `resource_locked` carries a path per file, so
+    //! a granted acquisition reconstructs one per entry.
+    //!
     //! ```text
     //! cargo test --release -p lore-revision lock_scale -- --ignored --nocapture
     //! ```
@@ -11182,6 +11186,21 @@ mod lock_scale_bench {
                 }
                 let by_path = start.elapsed();
 
+                // Reverse resolution: what a notification costs. A granted
+                // acquisition emits `resource_locked` carrying a `LockResource`
+                // per file, and that shape has a path in it — so a large
+                // acquisition reconstructs one path per entry after the response
+                // is sent. It is off the hot path, and it is the one place a
+                // 100,000-entry acquisition still touches paths at all.
+                let start = Instant::now();
+                for id in &nodes {
+                    state
+                        .node_path(repository.clone(), *id)
+                        .await
+                        .expect("path by node");
+                }
+                let to_path = start.elapsed();
+
                 // Distinct node blocks the set touches — what "no locality" claims.
                 let all: HashSet<usize> = nodes.iter().map(|id| NodeBlock::index(*id)).collect();
                 let sample: Vec<NodeID> = nodes.iter().copied().step_by(17).collect();
@@ -11199,6 +11218,11 @@ mod lock_scale_bench {
                     by_path,
                     per(by_path, paths.len()),
                     by_path.as_secs_f64() / by_node.as_secs_f64().max(f64::EPSILON)
+                );
+                println!(
+                    "  to path      {:>10.2?}   {:>9.2?} per entry   notification reconstruction",
+                    to_path,
+                    per(to_path, nodes.len())
                 );
                 println!(
                     "  blocks       {} for all {}, {} for a {}-entry scattered sample",

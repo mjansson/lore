@@ -855,6 +855,139 @@ mod tests {
         }
     }
 
+    /// Whether a stream's resident set tracks the acquisition or the stream.
+    ///
+    /// The design bounds a lock node's memory by capping concurrent `Acquire`
+    /// streams, which is only a bound if one stream's residency does not grow
+    /// with the size of the acquisition it is serving. That is the claim here:
+    /// walk the same fixture at several batch sizes and watch the peak.
+    async fn run_residency_shape(
+        mutable: Arc<dyn lore_storage::MutableStore>,
+        files: usize,
+        batches: &[usize],
+        depth: usize,
+    ) {
+        let largest = *batches.iter().max().expect("at least one batch size");
+        let repository = test_repository(mutable).await;
+        let branch = Context::from(uuid::Uuid::now_v7());
+        let state = Arc::new(State::new());
+
+        let directories = 64usize;
+        let mut dirs = Vec::with_capacity(directories);
+        for d in 0..directories {
+            let name = format!("dir_{d}");
+            dirs.push(
+                add(
+                    &state,
+                    repository.clone(),
+                    ROOT_NODE,
+                    directory(&name),
+                    &name,
+                )
+                .await,
+            );
+        }
+        let mut all = Vec::with_capacity(files);
+        for i in 0..files {
+            let name = format!("asset_{i}.uasset");
+            all.push(
+                add(
+                    &state,
+                    repository.clone(),
+                    dirs[i % directories],
+                    file(&name, Hash::from_u64(i as u64 + 1)),
+                    &name,
+                )
+                .await,
+            );
+        }
+
+        // Scattered, because that is the case residency is at risk in.
+        let stride = (files / largest.max(1)).max(1);
+        let chosen: Vec<NodeID> = all.iter().copied().step_by(stride).take(largest).collect();
+
+        let mut revision = commit_in_memory_revision(
+            repository.clone(),
+            &token(),
+            state.clone(),
+            metadata_on(branch),
+            Hash::default(),
+            branch,
+        )
+        .await
+        .expect("the base revision must commit");
+
+        for step in 0..depth {
+            for (index, node_id) in chosen.iter().enumerate() {
+                let node = state
+                    .node(repository.clone(), *node_id)
+                    .await
+                    .expect("the file must read back");
+                state
+                    .node_modify(
+                        repository.clone(),
+                        *node_id,
+                        node.mode,
+                        node.size + 1,
+                        Address {
+                            hash: Hash::from_u64(0xC0FFEE + (step * largest + index) as u64),
+                            context: node.address.context,
+                        },
+                    )
+                    .await
+                    .expect("modifying the file must succeed");
+                let (staged, dirty) = State::staged_edit_flags(&node);
+                state
+                    .node_mark_staged(repository.clone(), *node_id, staged, dirty)
+                    .await
+                    .expect("marking the modification must succeed");
+            }
+            revision = commit_in_memory_revision(
+                repository.clone(),
+                &token(),
+                state.clone(),
+                metadata_on(branch),
+                revision,
+                branch,
+            )
+            .await
+            .expect("the edit must commit");
+        }
+
+        let tip = State::deserialize(repository.clone(), revision)
+            .await
+            .expect("the tip must deserialize");
+
+        println!("\n  one stream's peak residency against the size of its acquisition");
+        println!("    entries    holding blocks        block-sorted");
+        for batch in batches {
+            let slice = &chosen[..*batch];
+            let mut row = Vec::new();
+            for hold in [Hold::StatesAndBlocks, Hold::SortedBlocks] {
+                let reads = Reads::default();
+                let (_, resident) = batch_walk(
+                    &repository,
+                    &tip,
+                    slice,
+                    Hash::from_u64(0xDEAD_BEEF),
+                    0,
+                    hold,
+                    &reads,
+                )
+                .await;
+                reads.take();
+                row.push(resident);
+            }
+            println!(
+                "    {batch:>7}    {:>5} blocks {:>5.0} MB    {:>4} blocks {:>4.0} MB",
+                row[0],
+                (row[0] * 64 * 1024) as f64 / (1024.0 * 1024.0),
+                row[1],
+                (row[1] * 64 * 1024) as f64 / (1024.0 * 1024.0),
+            );
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "measurement, not a test — run explicitly"]
     async fn caught_up_check_scale() {
@@ -900,6 +1033,15 @@ mod tests {
                     run_batch_shape(mutable.clone(), batch_tree, batch, batch_depth, scattered)
                         .await;
                 }
+
+                println!("\nwhat one Acquire stream keeps resident");
+                run_residency_shape(
+                    mutable.clone(),
+                    batch_tree,
+                    &[batch / 4, batch, batch * 4],
+                    batch_depth,
+                )
+                .await;
                 println!();
             }))
             .await
