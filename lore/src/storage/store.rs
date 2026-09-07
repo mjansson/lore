@@ -140,6 +140,18 @@ pub(crate) struct StoreInternal {
     pub in_flight: AtomicU64,
     pub invalid: AtomicBool,
     pub drained: Notify,
+    /// This process's claim on the stores, held for as long as the handle is open.
+    ///
+    /// An open store is a store this process is using, and the flock is what says so
+    /// to other processes. Taking the claim here rather than per operation is what
+    /// makes it mean that: the alternative counts operations, which says nothing
+    /// about whether anyone has the store, and pays a lock acquisition and an epoch
+    /// read on every call.
+    ///
+    /// Dropped with the handle, at close. The keep-alive cache may still hold the
+    /// store objects afterwards — that is retained memory, not an open store, and
+    /// the epoch is what decides whether it is still usable when one is opened again.
+    _hold: lore_storage::local::store_lock::StoreHold,
 }
 
 impl StoreInternal {
@@ -149,6 +161,7 @@ impl StoreInternal {
         mutable: Arc<dyn MutableStore>,
         remote: Option<Arc<RemoteEndpoint>>,
         bound_flags: BoundFlags,
+        hold: lore_storage::local::store_lock::StoreHold,
     ) -> Self {
         Self {
             identity: identity.into(),
@@ -160,6 +173,7 @@ impl StoreInternal {
             in_flight: AtomicU64::new(0),
             invalid: AtomicBool::new(false),
             drained: Notify::new(),
+            _hold: hold,
         }
     }
 
@@ -383,12 +397,15 @@ pub(crate) async fn in_memory_for_tests(identity: impl Into<String>) -> Arc<Stor
         .await
         .expect("in-memory mutable store init"),
     );
+    // In-memory stores have no directory and so no flock to claim; an empty hold is
+    // what `hold_for_command` returns for them anyway.
     Arc::new(StoreInternal::new(
         identity,
         immutable,
         mutable,
         None,
         BoundFlags::default(),
+        lore_storage::local::store_lock::StoreHold::default(),
     ))
 }
 

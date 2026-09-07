@@ -473,6 +473,7 @@ mod tests {
                 mutable,
                 None,
                 crate::storage::store::BoundFlags::default(),
+                lore_storage::local::store_lock::StoreHold::default(),
             )
             .with_connection_id(connection_id),
         )

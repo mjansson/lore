@@ -28,7 +28,9 @@ const LOCK_RETRY_MAX: Duration = Duration::from_millis(10);
 const LOCK_WAIT_WARN: Duration = Duration::from_secs(5);
 
 pub struct FSLock {
-    file: std::fs::File,
+    /// The locked file. `None` only after [`FSLock::release_keeping_file`] has
+    /// taken it, which is also what stops the drop below unlocking twice.
+    file: Option<std::fs::File>,
 }
 
 impl FSLock {
@@ -82,7 +84,7 @@ impl FSLock {
             }
         };
         Self::lock_blocking(&file)?;
-        Ok(FSLock { file })
+        Ok(FSLock { file: Some(file) })
     }
 
     /// Opens the lock file and takes the OS lock, retrying while another holder has it.
@@ -94,7 +96,7 @@ impl FSLock {
     /// sustained contention. And the wait stays unbounded, matching the blocking lock callers had
     /// before, which means a peer that never releases would otherwise look exactly like a hang —
     /// hence the warning once the wait passes [`LOCK_WAIT_WARN`].
-    async fn acquire_exact_path(path: &Path) -> std::io::Result<FSLock> {
+    pub async fn acquire_exact_path(path: &Path) -> std::io::Result<FSLock> {
         let mut retry = 2;
         let file = loop {
             match Self::open_lock_file(path) {
@@ -108,13 +110,28 @@ impl FSLock {
                 }
             }
         };
+        Self::acquire_open_file(file, path).await
+    }
 
+    /// Takes the OS lock on a lock file that is **already open**, waiting the same
+    /// way [`Self::acquire_exact_path`] does.
+    ///
+    /// For a caller that acquires and releases the same lock repeatedly: pairing
+    /// this with [`Self::release_keeping_file`] makes a re-acquisition one lock call
+    /// rather than an open, a lock, an unlock and a close. `path` is used only for
+    /// the contention warning.
+    ///
+    /// # Errors
+    ///
+    /// [`std::io::Error`] if the lock cannot be taken for a reason other than
+    /// contention; contention itself waits.
+    pub async fn acquire_open_file(file: std::fs::File, path: &Path) -> std::io::Result<FSLock> {
         let started = std::time::Instant::now();
         let mut delay = LOCK_RETRY_START;
         let mut warned = false;
         loop {
             match Self::try_lock(&file) {
-                Ok(()) => return Ok(FSLock { file }),
+                Ok(()) => return Ok(FSLock { file: Some(file) }),
                 Err(err) if is_lock_contended(&err) => {
                     if !warned && started.elapsed() >= LOCK_WAIT_WARN {
                         crate::lore_warn!(
@@ -226,18 +243,43 @@ fn is_lock_contended(err: &std::io::Error) -> bool {
     err.raw_os_error() == Some(libc::EWOULDBLOCK)
 }
 
-impl Drop for FSLock {
-    fn drop(&mut self) {
+impl FSLock {
+    /// Releases the OS lock and hands back the still-open file.
+    ///
+    /// So that a caller taking and releasing one lock repeatedly can keep the
+    /// descriptor and pay only the lock call next time — see
+    /// [`Self::acquire_open_file`]. Both platforms separate unlocking from closing
+    /// (`UnlockFile`, `flock(LOCK_UN)`), so this costs the same either way.
+    ///
+    /// `None` if the file was already taken, which cannot happen through the public
+    /// API: this consumes the lock.
+    pub fn release_keeping_file(mut self) -> Option<std::fs::File> {
+        let file = self.file.take()?;
+        Self::unlock(&file);
+        Some(file)
+    }
+
+    /// Releases the OS lock without closing the file.
+    fn unlock(file: &std::fs::File) {
         #[cfg(target_family = "windows")]
         {
             // Safety: Calling OS functions
-            unsafe { FileSystem::UnlockFile(self.file.as_raw_handle(), 0, 0, !0, !0) };
+            unsafe { FileSystem::UnlockFile(file.as_raw_handle(), 0, 0, !0, !0) };
         }
 
         #[cfg(not(target_family = "windows"))]
         {
             // Safety: Calling OS functions
-            unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+        }
+    }
+}
+
+impl Drop for FSLock {
+    fn drop(&mut self) {
+        // Absent only when `release_keeping_file` already unlocked and took it.
+        if let Some(file) = self.file.as_ref() {
+            Self::unlock(file);
         }
     }
 }

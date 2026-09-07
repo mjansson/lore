@@ -610,7 +610,7 @@ mod tests {
                         .expect("Failed to query store entry");
 
                     let read_buffer =
-                        LocalImmutableStore::load(store.packstore(entry.group), entry.data)
+                        LocalImmutableStore::load(&store.group[entry.group].packstore, entry.data)
                             .await
                             .expect("Failed to load store entry");
                     assert_eq!(
@@ -636,7 +636,7 @@ mod tests {
                         .expect("Failed to query store entry");
 
                     let read_buffer =
-                        LocalImmutableStore::load(store.packstore(entry.group), entry.data)
+                        LocalImmutableStore::load(&store.group[entry.group].packstore, entry.data)
                             .await
                             .expect("Failed to load store entry");
                     assert_eq!(
@@ -749,10 +749,12 @@ mod tests {
                             StoreMatch::MatchFull,
                             "Query did not match expected entry"
                         );
-                        let buffer =
-                            LocalImmutableStore::load(store.packstore(entry.group), entry.data)
-                                .await
-                                .expect("Failed to load store entry");
+                        let buffer = LocalImmutableStore::load(
+                            &store.group[entry.group].packstore,
+                            entry.data,
+                        )
+                        .await
+                        .expect("Failed to load store entry");
                         assert_eq!(
                             buffer.len(),
                             entry.data.size_payload as usize,
@@ -895,10 +897,12 @@ mod tests {
                             StoreMatch::MatchFull,
                             "Query did not match expected entry"
                         );
-                        let buffer =
-                            LocalImmutableStore::load(store.packstore(entry.group), entry.data)
-                                .await
-                                .expect("Failed to load store entry");
+                        let buffer = LocalImmutableStore::load(
+                            &store.group[entry.group].packstore,
+                            entry.data,
+                        )
+                        .await
+                        .expect("Failed to load store entry");
                         assert_eq!(
                             buffer.len(),
                             entry.data.size_payload as usize,

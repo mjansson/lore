@@ -1492,7 +1492,22 @@ pub fn load_repository_config(path: impl AsRef<Path>) -> Result<RepositoryConfig
 /// acquisition; the underlying flock drops when the last strong reference is
 /// released.
 pub(crate) struct RepositoryLock {
+    /// Declared first so it drops first. Rust drops fields in declaration order,
+    /// so the repository flock is released before the store locks that contain
+    /// it — the reverse of acquisition, which is what containment means on the
+    /// way out.
     _lock: FSLock,
+    /// The store locks this repository lock lives inside.
+    ///
+    /// Owning them is what makes the containment a type rather than a rule: there is
+    /// no constructor that does not take one, so "repository flock without store
+    /// flocks" is unrepresentable, with no exception.
+    ///
+    /// Repository *creation* needs none of this. It establishes `.lore` where none
+    /// existed, so no other process can be holding anything for it, and its writes go
+    /// through the stores, each taking its own hold — which is already the containing
+    /// order.
+    _stores: lore_storage::local::store_lock::StoreHold,
 }
 
 static REPOSITORY_LOCK_CACHE: OnceLock<DashMap<PathBuf, Weak<RepositoryLock>>> = OnceLock::new();
@@ -1516,6 +1531,7 @@ static REPOSITORY_LOCK_INIT_MUTEXES: OnceLock<
 /// for a given path at a time; others wait, then observe the cached entry.
 pub(crate) async fn get_or_create_repository_lock(
     dot_path: PathBuf,
+    stores: lore_storage::local::store_lock::StoreHold,
 ) -> Result<Arc<RepositoryLock>, RepositoryError> {
     let cache = REPOSITORY_LOCK_CACHE.get_or_init(DashMap::new);
 
@@ -1553,7 +1569,10 @@ pub(crate) async fn get_or_create_repository_lock(
         .await
         .internal("Failed to get exclusive access to repository")?;
 
-    let holder = Arc::new(RepositoryLock { _lock: lock });
+    let holder = Arc::new(RepositoryLock {
+        _lock: lock,
+        _stores: stores,
+    });
     cache.insert(dot_path, Arc::downgrade(&holder));
     Ok(holder)
 }
@@ -2042,14 +2061,6 @@ pub async fn load_and_connect_with_token(
 
     let dot_path = get_dot_lore_path(path)?;
 
-    // Acquire (or reuse) the process-local repository flock. NoStore commands
-    // skip this — they don't touch repository files.
-    let repo_lock = if access != RepositoryAccess::NoStore {
-        Some(get_or_create_repository_lock(dot_path.clone()).await?)
-    } else {
-        None
-    };
-
     let id_path = dot_path.join(ID);
     let config_path = dot_path.join(CONFIG);
 
@@ -2157,6 +2168,47 @@ pub async fn load_and_connect_with_token(
 
         needs_upgrade = mutable_store.needs_upgrade();
         (immutable_store, mutable_store as Arc<dyn MutableStore>)
+    };
+
+    // Acquired **after** the stores and contained by their locks. The two ways
+    // into a store take locks on two paths — `lore_storage_open` takes store
+    // locks and has no repository lock to put first, while this one used to take
+    // the repository lock before opening anything — and two orders over one pair
+    // is a cycle that neither process returns from. The store locks are therefore
+    // the outer pair, which is the order both paths can satisfy.
+    //
+    // The cost is that `id`, `config` and `instance` are read above without the
+    // repository flock. `lore_storage_open` already reads the config that way, on
+    // the path that runs most often.
+    //
+    // NoStore commands skip this — they touch no repository files.
+    let repo_lock = if access == RepositoryAccess::NoStore {
+        None
+    } else {
+        let mut guards = Vec::new();
+        if let Some(guard) = immutable_store
+            .clone()
+            .hold_for_command()
+            .await
+            .forward_any::<RepositoryError>("holding the immutable store lock")?
+        {
+            guards.push(guard);
+        }
+        if let Some(guard) = mutable_store
+            .clone()
+            .hold_for_command()
+            .await
+            .forward_any::<RepositoryError>("holding the mutable store lock")?
+        {
+            guards.push(guard);
+        }
+        Some(
+            get_or_create_repository_lock(
+                dot_path.clone(),
+                lore_storage::local::store_lock::StoreHold::new(guards),
+            )
+            .await?,
+        )
     };
 
     let filter = load_filter(path).unwrap_or_default();

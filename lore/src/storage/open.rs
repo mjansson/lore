@@ -298,12 +298,33 @@ async fn open_local(
             None
         };
 
+        // Claim the stores for as long as this handle is open. An open store is one
+        // this process is using, and the flock is how other processes are told; the
+        // claim therefore belongs to the handle's lifetime, not to each call made
+        // through it. Every operation below then joins this claim instead of taking
+        // a lock and reading the epoch of its own.
+        let mut guards = Vec::new();
+        if let Some(guard) =
+            immutable.clone().hold_for_command().await.map_err(|err| {
+                OpenError::internal_with_context(err, "claiming the immutable store")
+            })?
+        {
+            guards.push(guard);
+        }
+        if let Some(guard) =
+            mutable.clone().hold_for_command().await.map_err(|err| {
+                OpenError::internal_with_context(err, "claiming the mutable store")
+            })?
+        {
+            guards.push(guard);
+        }
         let store = Arc::new(StoreInternal::new(
             identity,
             immutable,
             mutable,
             remote,
             bound_flags,
+            lore_storage::local::store_lock::StoreHold::new(guards),
         ));
         let handle = handle::register(store);
         LoreEvent::StorageOpened(LoreStorageOpenedEventData {

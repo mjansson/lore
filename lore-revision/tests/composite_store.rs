@@ -1672,6 +1672,54 @@ mod tests {
     /// can name, is a write the durable store can answer with a copy. The caller supplying the
     /// payload is what makes naming that source its own to use, since ingress verified the payload
     /// against this address.
+    /// **A composite claims the local store it wraps.**
+    ///
+    /// `hold_for_command` has a trait default answering `None`, which is right for a
+    /// store with nothing on disk and wrong for a wrapper around one that has. Left
+    /// inherited, a storage handle over a composite opens holding nothing and then
+    /// reads and writes a store no process has claimed — silently, since an empty
+    /// claim is indistinguishable from a store that needed none.
+    #[tokio::test]
+    async fn a_composite_claims_the_local_store_it_wraps() {
+        use lore_storage::local::immutable_store::ImmutableStoreSettings;
+        use lore_storage::local::immutable_store::LocalImmutableStore;
+
+        let dir = std::env::temp_dir().join(format!("lore-composite-claim-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch directory");
+
+        let execution = setup_test_execution();
+        let scratch = dir.clone();
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let local: Arc<dyn lore_storage::ImmutableStore> =
+                    LocalImmutableStore::new(Some(scratch), ImmutableStoreSettings::default())
+                        .await
+                        .expect("local store");
+                // The same store stands in as the durable target, which `build` requires;
+                // this asserts what the composite claims, not how it routes reads.
+                let composite = Arc::new(
+                    CompositeStoreBuilder::default()
+                        .with_local("local".to_string(), local.clone())
+                        .expect("local target")
+                        .with_durable("durable".to_string(), local)
+                        .expect("durable target")
+                        .build()
+                        .expect("composite builds"),
+                );
+
+                let claim = composite.hold_for_command().await.expect("claim taken");
+                assert!(
+                    claim.is_some(),
+                    "a composite wrapping a store with files on disk must claim it, \
+                     not inherit the default that claims nothing"
+                );
+            })
+            .await;
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     mod put_duplicates_a_durable_association {
         use super::*;
 
